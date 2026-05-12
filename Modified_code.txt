@@ -1,0 +1,159 @@
+import os
+import streamlit as st
+import pandas as pd
+import warnings
+from dotenv import load_dotenv
+
+# Tabular Data
+from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
+from langchain_experimental.agents import create_pandas_dataframe_agent
+
+# Text/Document Data
+from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+
+# SECURITY BYPASS
+load_dotenv()
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+
+os.environ["no_proxy"] = "*"
+os.environ["CURL_CA_BUNDLE"] = ""
+os.environ["PYTHONHTTPSVERIFY"] = "0"
+warnings.filterwarnings("ignore")
+
+st.set_page_config(page_title="Data Agent", layout="wide")
+st.title("Data & Document Analyst")
+
+# INITIALIZE NVIDIA AI
+@st.cache_resource
+def init_models():
+    llm = ChatNVIDIA(
+        model="meta/llama-3.1-70b-instruct", 
+        api_key=NVIDIA_API_KEY, 
+        temperature=0, 
+        streaming=True 
+    )
+    embedder = NVIDIAEmbeddings(model="nvidia/nv-embedqa-e5-v5", api_key=NVIDIA_API_KEY)
+    return llm, embedder
+
+llm, embedder = init_models()
+
+# FILE UPLOADER
+uploaded_file = st.file_uploader("Upload Data (CSV/Excel) or Documents (PDF/Docx/TXT)", 
+                                 type=["csv", "xlsx", "pdf", "docx", "txt"])
+
+if uploaded_file:
+    ext = uploaded_file.name.split('.')[-1].lower()
+    
+    #TABULAR DATA
+    if ext in ['csv', 'xlsx']:
+        sheet_info = ""
+        
+        # DATA LOADING
+        if ext == 'xlsx':
+            try:
+                xl = pd.ExcelFile(uploaded_file)
+                sheet_names = xl.sheet_names
+                sheet_info = f"This workbook has {len(sheet_names)} sheets: {', '.join(sheet_names)}."
+                
+                # Dropdown for manager to select the sheet
+                selected_sheet = st.selectbox("Select Sheet to Analyze", sheet_names)
+                df = xl.parse(selected_sheet)
+            except Exception as e:
+                st.error(f"Excel Load Error: {e}")
+                st.stop()
+        else:
+            df = pd.read_csv(uploaded_file)
+            sheet_info = "This is a CSV file (single sheet)."
+
+        st.success(f"Successfully loaded {len(df)} rows.")
+        with st.expander("Preview Selected Data"):
+            st.dataframe(df.head(5))
+
+        # PREFIX
+        universal_prefix = """You are a world-class Data Analyst. The dataframe 'df' is already loaded.
+
+        STRICT EXECUTION RULES:
+        1. TOOL USAGE: Use 'python_repl_ast' for ALL data tasks. Never guess.
+        2. NO IMPORTS: Do NOT 'import pandas' or 'import numpy'. They are already available.
+        3. DATA TYPES: Always convert columns to numeric using 'pd.to_numeric(df[col], errors="coerce")' before doing math to avoid 'String' errors.
+        4. DIVISION BY ZERO: When calculating ratios, handle division by zero using '.replace([np.inf, -np.inf], np.nan).fillna(0)'.
+        5. COLUMN NAMES: If a column name is not found, check 'df.columns' for similar names before giving up.
+        6. OUTPUT: Strictly provide ONLY the final result. Format: 'Final Answer: [Result]'. No code, no explanations.
+        7. FAILURE: If the operation is impossible after 3 code attempts, say 'Final Answer: Data structure prevents this calculation'.
+
+        CONTEXT:
+        - Sheet Info: {sheet_info}
+        - Data Preview: {df_head}"""
+
+        # INITIALIZE THE AGENT
+        agent = create_pandas_dataframe_agent(
+            llm, 
+            df, 
+            verbose=False, 
+            allow_dangerous_code=True,
+            agent_type="zero-shot-react-description",
+            max_iterations=10, 
+            handle_parsing_errors=True,
+            prefix=universal_prefix.format(sheet_info=sheet_info, df_head=df.head(1).to_string())
+        )
+
+        # INTERFACE
+        user_query = st.chat_input("Ask a question about this data...")
+        if user_query:
+            st.chat_message("user").write(user_query)
+            with st.spinner("Analyzing..."):
+                try:
+                    # Invoke the agent
+                    response = agent.invoke({"input": user_query})
+                    st.chat_message("assistant").write(response["output"])
+                except Exception as e:
+                    # Professional error handling for the UI
+                    st.error("The agent encountered an issue with that specific query. Please try rephrasing.")
+
+    # DOCUMENTS (PDF/WORD/TXT)
+    # --- PATH B: DOCUMENTS (PDF/WORD/TXT) ---
+    else:
+        temp_path = f"temp_{uploaded_file.name}"
+        with open(temp_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        try:
+            if ext == 'pdf': loader = PyPDFLoader(temp_path)
+            elif ext == 'docx': loader = Docx2txtLoader(temp_path)
+            else: loader = TextLoader(temp_path)
+
+            with st.spinner("Indexing document..."):
+                docs = loader.load()
+                # BETTER SPLITTER: Prevents "context overflow" errors
+                text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+                chunks = text_splitter.split_documents(docs)
+                
+                vectorstore = FAISS.from_documents(chunks, embedder)
+                # BETTER RETRIEVER: Fetches more context for complex questions
+                retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+            user_query = st.chat_input("Ask about the document content...")
+            if user_query:
+                st.chat_message("user").write(user_query)
+                with st.chat_message("assistant"):
+                    with st.spinner("Searching..."):
+                        docs_found = retriever.invoke(user_query)
+                        context = "\n\n".join([d.page_content for d in docs_found])
+                        
+                        final_prompt = f"""Use ONLY the following context to answer. 
+                        If not mentioned, say 'Not mentioned in document'.
+                        
+                        CONTEXT:
+                        {context}
+                        
+                        QUESTION: {user_query}"""
+                        
+                        response = llm.invoke(final_prompt)
+                        st.write(response.content)
+        finally:
+            if os.path.exists(temp_path): os.remove(temp_path)
+
+else:
+    st.info("Please upload a CSV, Excel, or Document to begin analysis.")
